@@ -1,0 +1,2065 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Starlinks API",
+    "version": "1.1.0",
+    "summary": "Smart links, pre-saves and promo images for distributors.",
+    "description": "Give your artists and labels smart links, pre-saves, analytics and promo images under your own brand. Create links automatically when releases are delivered, embed our link creator in your dashboard, and stay in sync with signed webhooks.\n\n## Quickstart\n\n1. Once your distributor account is approved, you get a link to set your portal password.\n2. In your portal, add your branding and, under **API**, create a key. Copy it when it's shown: we only keep a hash.\n3. Create your first link. With a UPC, we find the stores, the artwork and the artist photo:\n\n```bash\ncurl -X POST \"https://starlinks.starmakersdistro.com/api/v1/links\" \\\n  -H \"Authorization: Bearer $STARLINKS_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"upc\": \"196871234567\",\n    \"release_date\": \"2026-11-20T00:00:00Z\",\n    \"owner_email\": \"artist@example.com\"\n  }'\n```\n\nThe response has the link's `url`, its `share_images` and its `state`. A future `release_date` makes a pre-save page with a countdown that switches to play links on release day. With `owner_email`, the artist gets an email with their link, a private edit link and promo images.\n\n## Authentication, limits and errors\n\n- **Authentication:** send your API key as `Authorization: Bearer slk_<partner id>_<secret>`. Keep it on your server: the API sends no CORS headers, so browsers can't call it. Making a new key in the portal stops the old one straight away.\n- **Limits:** 1,000 requests an hour per distributor (`429` when exceeded), plus your daily link-creation limit.\n- **Idempotency:** creating a link for a UPC/ISRC that already has one returns that link (`existing: true`), so retries never duplicate links.\n- **Errors:** every error is JSON `{ \"error\": \"message\" }` with a meaningful status code.\n\n## Ways to integrate\n\n| | |\n|---|---|\n| **REST API** | Create links automatically on delivery, read analytics, keep links in sync. |\n| **Embed** | Paste one snippet into your dashboard; your users create links themselves, under your brand. |\n| **Webhooks** | A signed request to your server when links are created or change, go live, find new stores, or get pre-saves. |\n| **Promo images** | Story, Square and Wide images per link, with your logo, the stores, the link and a QR code. |\n\nEverything carries your brand: your logo, colors and font on fan pages, the embed, emails and promo images, and links on your own domain once you connect it in the portal.\n\n## Webhooks\n\nSet your HTTPS address and choose events in the portal, under **Webhooks**. Each event is a `POST` with a JSON body:\n\n```json\n{\n  \"id\": \"whd_mgvq3k2a_5f1c9e2b\",\n  \"type\": \"link.released\",\n  \"created_at\": \"2026-11-20T00:04:12.000Z\",\n  \"data\": { \"link\": { \"id\": \"…\", \"url\": \"…\", \"state\": \"live\", \"artist_name\": \"…\", \"release_title\": \"…\", \"stores\": { } } }\n}\n```\n\n| Event | When |\n|---|---|\n| `link.created` | A link was created (`data.source`: `embed`, `portal` or `api`). |\n| `link.updated` | A link was edited (`data.source`: `portal`, `api` or `creator`). |\n| `link.deleted` | A link was deleted (`data.link` is the link as it was). |\n| `link.released` | A pre-save link's release date passed and it now shows play links. Sent once. |\n| `link.stores_found` | A re-scan found more stores (`data.added` maps each new store field to its link). |\n| `presave.added` | A fan pre-saved (`data.channel`: `email`, `spotify`, `apple`, `tidal` or `youtube`). Fans' identities are never sent. |\n| `ping` | The test event from the portal. |\n\n**Delivery.** Reply with any `2xx` within 3 seconds. Anything else is retried after 1, 5 and 30 minutes, then 2, 6 and 12 hours. The portal lists recent deliveries, lets you resend them, and sends test events. The `id` is the same on every retry, so you can ignore duplicates.\n\n**Verify every request.** Each request has the headers `Starlinks-Event`, `Starlinks-Delivery` and `Starlinks-Signature: t=<unix seconds>,v1=<hex>`, where `v1` is HMAC-SHA256 of `<t>.<raw body>` with the signing secret from your portal. Compare in constant time and reject timestamps older than 5 minutes.\n\nNode.js (Express):\n\n```js\nimport crypto from \"node:crypto\";\nimport express from \"express\";\n\n// Check the signature against the raw body, before parsing it.\nfunction verifyStarlinks(rawBody, header, secret) {\n  const parts = Object.fromEntries(header.split(\",\").map((part) => part.split(\"=\")));\n  const t = Number(parts.t);\n  if (!t || Math.abs(Date.now() / 1000 - t) > 300) return false; // older than 5 minutes\n  const expected = crypto.createHmac(\"sha256\", secret).update(`${t}.${rawBody}`).digest();\n  const given = Buffer.from(parts.v1 || \"\", \"hex\");\n  return given.length === expected.length && crypto.timingSafeEqual(given, expected);\n}\n\nconst app = express();\napp.post(\"/webhooks/starlinks\", express.raw({ type: \"application/json\" }), (req, res) => {\n  const ok = verifyStarlinks(req.body.toString(\"utf8\"), req.get(\"Starlinks-Signature\") || \"\", process.env.STARLINKS_WEBHOOK_SECRET);\n  if (!ok) return res.sendStatus(400);\n  const event = JSON.parse(req.body);\n  // event.id stays the same on retries: skip ids you've already handled.\n  res.sendStatus(200);\n});\n```\n\nPHP:\n\n```php\n<?php\n$raw = file_get_contents('php://input');\nparse_str(str_replace(',', '&', $_SERVER['HTTP_STARLINKS_SIGNATURE'] ?? ''), $parts);\n$t = (int) ($parts['t'] ?? 0);\n$expected = hash_hmac('sha256', $t . '.' . $raw, getenv('STARLINKS_WEBHOOK_SECRET'));\n\nif (abs(time() - $t) > 300 || !hash_equals($expected, $parts['v1'] ?? '')) {\n    http_response_code(400);\n    exit;\n}\n$event = json_decode($raw, true);\nhttp_response_code(200);\n```\n\nPython (Flask):\n\n```python\nimport hashlib, hmac, os, time\nfrom flask import Flask, request, abort\n\ndef verify_starlinks(raw: bytes, header: str, secret: str) -> bool:\n    parts = dict(part.split(\"=\", 1) for part in header.split(\",\") if \"=\" in part)\n    t = int(parts.get(\"t\", \"0\") or 0)\n    if abs(time.time() - t) > 300:  # older than 5 minutes\n        return False\n    expected = hmac.new(secret.encode(), f\"{t}.\".encode() + raw, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, parts.get(\"v1\", \"\"))\n\napp = Flask(__name__)\n\n@app.post(\"/webhooks/starlinks\")\ndef starlinks():\n    if not verify_starlinks(request.get_data(), request.headers.get(\"Starlinks-Signature\", \"\"), os.environ[\"STARLINKS_WEBHOOK_SECRET\"]):\n        abort(400)\n    event = request.get_json()\n    return \"\", 200\n```\n\n## Embed\n\nPaste this where your users should create links. Your exact code, with your embed key, is in the portal. It only works on the domains you list in the portal, resizes itself to its content, and lets users share promo images straight to apps on phones.\n\n```html\n<iframe id=\"starlinks-embed\" src=\"https://www.starmakersdistro.com/embed/<your embed key>\" title=\"Create a smart link\" width=\"100%\" height=\"900\" style=\"border:0;border-radius:16px;max-width:1100px\" loading=\"lazy\" allow=\"clipboard-write; web-share\"></iframe>\n<script>\n  window.addEventListener(\"message\", function (event) {\n    if (event.origin !== \"https://www.starmakersdistro.com\" || !event.data || event.data.type !== \"starlinks:resize\") return;\n    document.getElementById(\"starlinks-embed\").style.height = event.data.height + \"px\";\n  });\n</script>\n```\n\nOnce your custom domain is connected, the portal's embed code uses it instead of www.starmakersdistro.com.\n\n## Account linking (optional)\n\nTurn on account linking in the portal so your signed-in users see their links under **My links** in the embed, without emailed edit links. Your server signs the user's id and an expiry (at most 7 days ahead) with the account secret from the portal, and adds them to the embed address. Unsigned or expired requests are refused. Links created through the API with the same `owner_uid` appear there too.\n\n```js\nconst crypto = require(\"crypto\");\n\nconst uid = String(user.id); // your user's id\nconst exp = Math.floor(Date.now() / 1000) + 24 * 60 * 60; // valid 24 hours\nconst sig = crypto.createHmac(\"sha256\", process.env.STARLINKS_SECRET).update(`${uid}.${exp}`).digest(\"hex\");\nconst src = `https://www.starmakersdistro.com/embed/<your embed key>?uid=${encodeURIComponent(uid)}&exp=${exp}&sig=${sig}`;\n```\n\nThe portal shows the same example in PHP and Python.\n\n## Pre-saves, store links and promo images\n\n- **Pre-saves:** a link with a future `release_date` shows a countdown and only the stores that take pre-saves. Fans can leave an email for a one-time release-day message, or connect Spotify, Apple Music, TIDAL or YouTube Music to save the release automatically (`presave_stores` lists which are available for a link). On the release date the page switches to play links by itself, and `link.released` fires.\n- **Store links:** found from the UPC, ISRC or store link through each store's official API, accepting exact matches only. Stores that publish the release later are added automatically (`link.stores_found`).\n- **Promo images:** each published link has three PNGs in `share_images`: Story (1080×1920), Square (1080×1080) and Wide (1200×630), with your logo, the cover over the artist's photo, the stores, the link and a QR code. They always show the current details.\n- **Analytics:** views, store clicks and pre-saves by day, store, country, device and traffic source: `GET /links/{id}?stats=30`.\n\n## Changelog\n\n**October 2026**\n\n- Webhooks: link created, updated, deleted, release day, new stores found, and pre-saves, signed with HMAC-SHA256 and retried for about a day.\n- `GET /search` and `GET /artists/{ref}/releases` to find the exact release by artist and title.\n- `share_images` on every published link, and `presave_stores` on pre-save links.\n- Artists who give an email get their promo images with their link.\n- The embed resizes itself, and promo images can be shared straight to apps from phones.\n- REST API v1: create (idempotent by UPC/ISRC), list, get with analytics, update, delete.\n- Store pre-saves on Spotify, Apple Music, TIDAL and YouTube Music.\n- Ad pixels (Meta, TikTok, Google Ads, Snapchat) on fan pages, with cookie consent.\n\nQuestions: support@starmakersdistro.com\n",
+    "contact": {
+      "name": "Star Makers Distribution",
+      "url": "https://www.starmakersdistro.com",
+      "email": "support@starmakersdistro.com"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://starlinks.starmakersdistro.com/api/v1",
+      "description": "Production"
+    }
+  ],
+  "security": [
+    {
+      "apiKey": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Links",
+      "description": "Create, read, update and delete your smart links."
+    },
+    {
+      "name": "Search",
+      "description": "Find the exact release by artist and title before creating its link."
+    }
+  ],
+  "paths": {
+    "/links": {
+      "get": {
+        "tags": [
+          "Links"
+        ],
+        "operationId": "listLinks",
+        "summary": "List links",
+        "description": "All links in your distributor account, newest first. Filter by UPC, ISRC or your user's id.",
+        "parameters": [
+          {
+            "name": "upc",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only links with this UPC."
+          },
+          {
+            "name": "isrc",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only links with this ISRC."
+          },
+          {
+            "name": "owner_uid",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only links owned by this user of yours."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Your links.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "links"
+                  ],
+                  "properties": {
+                    "links": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/LinkSummary"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Your distributor account is paused or awaiting approval.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Hourly request limit reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Links"
+        ],
+        "operationId": "createLink",
+        "summary": "Create a link",
+        "description": "Creates a link from a UPC, ISRC or store link (`url`); store links, names, artwork and the artist photo are filled in from the stores. A future `release_date` makes a pre-save link that switches to play links on that date.\n\n**Idempotent by UPC/ISRC:** sending a release that already has a link returns that link with `existing: true` and status 200, so retries never create duplicates.\n\nIf the stores don't have the release yet, send `artist_name` and `release_title` too.\n\nWith `owner_email`, the artist is emailed their link, a private edit link and promo images (Story, Square, Wide).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkCreate"
+              },
+              "example": {
+                "upc": "196871234567",
+                "release_date": "2026-11-20T00:00:00Z",
+                "artist_name": "Artist Name",
+                "release_title": "Release Title",
+                "owner_email": "artist@example.com",
+                "owner_uid": "user-42"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "This release already had a link: returned unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkResult"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkResult"
+                },
+                "example": {
+                  "existing": false,
+                  "link": {
+                    "id": "8c1d2b0e-5f3a-4c7e-9a10-2b6f0d4e7a11",
+                    "url": "https://links.yourplatform.com/artist-name-release-title",
+                    "slug": "artist-name-release-title",
+                    "share_images": {
+                      "story": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/story.png",
+                      "square": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/square.png",
+                      "wide": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/wide.png"
+                    },
+                    "state": "presave",
+                    "artist_name": "Artist Name",
+                    "release_title": "Release Title",
+                    "release_date": "2026-11-20T00:00:00.000Z",
+                    "artwork_url": "https://i.scdn.co/image/ab67616d0000b273...",
+                    "upc": "196871234567",
+                    "isrc": "QZABC2600001",
+                    "owner_email": "artist@example.com",
+                    "owner_uid": "user-42",
+                    "stores": {
+                      "spotify_url": "https://open.spotify.com/album/...",
+                      "apple_music_url": "https://music.apple.com/album/..."
+                    },
+                    "pixels": {},
+                    "views": 0,
+                    "clicks": 0,
+                    "presaves": 0,
+                    "created_at": "2026-10-17T18:00:00.000Z",
+                    "updated_at": "2026-10-17T18:00:00.000Z"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input (for example a store link on the wrong domain).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account paused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Release not found in the stores (send artist_name and release_title), or pre-save links are turned off.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Hourly request limit or daily link limit reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/links/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The link's id."
+        }
+      ],
+      "get": {
+        "tags": [
+          "Links"
+        ],
+        "operationId": "getLink",
+        "summary": "Get a link",
+        "description": "One link. Pre-save links include `presave_stores`. Add `?stats=<days>` (1-365) for analytics.",
+        "parameters": [
+          {
+            "name": "stats",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 365
+            },
+            "description": "Include this many days of analytics."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The link (and stats when asked).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "link"
+                  ],
+                  "properties": {
+                    "link": {
+                      "$ref": "#/components/schemas/Link"
+                    },
+                    "stats": {
+                      "$ref": "#/components/schemas/Stats"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Link not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Hourly request limit reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Links"
+        ],
+        "operationId": "updateLink",
+        "summary": "Update a link",
+        "description": "Partial update: fields you don't send keep their values. Send `published: false` to take a link offline (draft) and `true` to publish it again. Changing `release_date` to the future makes it a pre-save link again.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkUpdate"
+              },
+              "example": {
+                "release_date": "2026-11-27T00:00:00Z",
+                "deezer_url": "https://www.deezer.com/album/123"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "link"
+                  ],
+                  "properties": {
+                    "link": {
+                      "$ref": "#/components/schemas/Link"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Link not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Hourly request limit reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Links"
+        ],
+        "operationId": "deleteLink",
+        "summary": "Delete a link",
+        "description": "Deletes the link; its address stops working.",
+        "responses": {
+          "200": {
+            "description": "Deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "id": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "example": {
+                  "ok": true,
+                  "id": "8c1d2b0e-5f3a-4c7e-9a10-2b6f0d4e7a11"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Link not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/search": {
+      "get": {
+        "tags": [
+          "Search"
+        ],
+        "operationId": "searchReleases",
+        "summary": "Search releases",
+        "description": "Finds artists, albums and tracks by artist name and/or title (Spotify, or Deezer when Spotify isn't available). Create the link with the chosen album or track's `url`.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 120
+            },
+            "description": "Artist and/or title."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matches.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "q is missing or too short.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/artists/{ref}/releases": {
+      "get": {
+        "tags": [
+          "Search"
+        ],
+        "operationId": "artistReleases",
+        "summary": "An artist's releases",
+        "description": "The artist's albums and singles, newest first. `ref` is an artist `id` from search, like `spotify:4q3ewBCX7sLwd24euuV69X`.",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Artist id from search."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The artist and releases.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtistReleases"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown artist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "link.created": {
+      "post": {
+        "operationId": "linkCreated",
+        "summary": "A link was created",
+        "description": "From your embed, portal, or API. `data.source` is `embed`, `portal` or `api`.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          },
+                          "source": {
+                            "type": "string",
+                            "description": "Where it was created.",
+                            "enum": [
+                              "embed",
+                              "portal",
+                              "api"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    },
+    "link.updated": {
+      "post": {
+        "operationId": "linkUpdated",
+        "summary": "A link was updated",
+        "description": "`data.source` is `portal`, `api` or `creator` (the artist, from their private edit link or My links).",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          },
+                          "source": {
+                            "type": "string",
+                            "description": "Who changed it.",
+                            "enum": [
+                              "portal",
+                              "api",
+                              "creator"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    },
+    "link.deleted": {
+      "post": {
+        "operationId": "linkDeleted",
+        "summary": "A link was deleted",
+        "description": "`data.link` is the link as it was.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          },
+                          "source": {
+                            "type": "string",
+                            "description": "Who deleted it.",
+                            "enum": [
+                              "portal",
+                              "api",
+                              "creator"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    },
+    "link.released": {
+      "post": {
+        "operationId": "linkReleased",
+        "summary": "Release day",
+        "description": "A pre-save link's release date passed: its page now shows play links. Sent once, within an hour of the release time.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    },
+    "link.stores_found": {
+      "post": {
+        "operationId": "linkStoresFound",
+        "summary": "New store links found",
+        "description": "A re-scan found the release on more stores. `data.added` maps each new store field to its link.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          },
+                          "added": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    },
+    "presave.added": {
+      "post": {
+        "operationId": "presaveAdded",
+        "summary": "A fan pre-saved",
+        "description": "`data.channel` is `email` (release-day email sign-up) or the store (`spotify`, `apple`, `tidal`, `youtube`). Fans' identities are never sent.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/WebhookEnvelope"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "data": {
+                        "type": "object",
+                        "properties": {
+                          "link": {
+                            "$ref": "#/components/schemas/WebhookLink"
+                          },
+                          "channel": {
+                            "type": "string",
+                            "description": "How the fan pre-saved.",
+                            "enum": [
+                              "email",
+                              "spotify",
+                              "apple",
+                              "tidal",
+                              "youtube"
+                            ]
+                          },
+                          "presaves": {
+                            "type": "integer",
+                            "description": "The link's pre-save total."
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "2XX": {
+            "description": "Return any 2xx status within 3 seconds to acknowledge. Anything else is retried."
+          }
+        },
+        "security": []
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "slk_<partner id>_<secret>",
+        "description": "Create or replace your key in the distributor portal. Only a hash is stored: copy it when it's shown."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "What went wrong, in plain words."
+          }
+        }
+      },
+      "Stores": {
+        "type": "object",
+        "description": "Store links by field.",
+        "properties": {
+          "spotify_url": {
+            "type": "string",
+            "description": "Spotify link (https, on Spotify's own domain).",
+            "format": "uri"
+          },
+          "apple_music_url": {
+            "type": "string",
+            "description": "Apple Music link (https, on Apple Music's own domain).",
+            "format": "uri"
+          },
+          "youtube_music_url": {
+            "type": "string",
+            "description": "YouTube Music link (https, on YouTube Music's own domain).",
+            "format": "uri"
+          },
+          "audiomack_url": {
+            "type": "string",
+            "description": "Audiomack link (https, on Audiomack's own domain).",
+            "format": "uri"
+          },
+          "boomplay_url": {
+            "type": "string",
+            "description": "Boomplay link (https, on Boomplay's own domain).",
+            "format": "uri"
+          },
+          "deezer_url": {
+            "type": "string",
+            "description": "Deezer link (https, on Deezer's own domain).",
+            "format": "uri"
+          },
+          "tidal_url": {
+            "type": "string",
+            "description": "TIDAL link (https, on TIDAL's own domain).",
+            "format": "uri"
+          },
+          "amazon_music_url": {
+            "type": "string",
+            "description": "Amazon Music link (https, on Amazon Music's own domain).",
+            "format": "uri"
+          },
+          "soundcloud_url": {
+            "type": "string",
+            "description": "SoundCloud link (https, on SoundCloud's own domain).",
+            "format": "uri"
+          },
+          "tiktok_url": {
+            "type": "string",
+            "description": "TikTok link (https, on TikTok's own domain).",
+            "format": "uri"
+          },
+          "itunes_url": {
+            "type": "string",
+            "description": "iTunes link (https, on iTunes's own domain).",
+            "format": "uri"
+          },
+          "pandora_url": {
+            "type": "string",
+            "description": "Pandora link (https, on Pandora's own domain).",
+            "format": "uri"
+          },
+          "iheartradio_url": {
+            "type": "string",
+            "description": "iHeartRadio link (https, on iHeartRadio's own domain).",
+            "format": "uri"
+          },
+          "napster_url": {
+            "type": "string",
+            "description": "Napster link (https, on Napster's own domain).",
+            "format": "uri"
+          },
+          "shazam_url": {
+            "type": "string",
+            "description": "Shazam link (https, on Shazam's own domain).",
+            "format": "uri"
+          },
+          "bandcamp_url": {
+            "type": "string",
+            "description": "Bandcamp link (https, on Bandcamp's own domain).",
+            "format": "uri"
+          },
+          "beatport_url": {
+            "type": "string",
+            "description": "Beatport link (https, on Beatport's own domain).",
+            "format": "uri"
+          },
+          "anghami_url": {
+            "type": "string",
+            "description": "Anghami link (https, on Anghami's own domain).",
+            "format": "uri"
+          },
+          "qobuz_url": {
+            "type": "string",
+            "description": "Qobuz link (https, on Qobuz's own domain).",
+            "format": "uri"
+          },
+          "jiosaavn_url": {
+            "type": "string",
+            "description": "JioSaavn link (https, on JioSaavn's own domain).",
+            "format": "uri"
+          },
+          "netease_url": {
+            "type": "string",
+            "description": "NetEase Cloud Music link (https, on NetEase Cloud Music's own domain).",
+            "format": "uri"
+          },
+          "mixcloud_url": {
+            "type": "string",
+            "description": "Mixcloud link (https, on Mixcloud's own domain).",
+            "format": "uri"
+          }
+        }
+      },
+      "Pixels": {
+        "type": "object",
+        "description": "Ad pixel IDs. Pixels load on the fan page only after the visitor accepts cookies; store clicks are reported as conversions.",
+        "properties": {
+          "meta_pixel_id": {
+            "type": "string",
+            "description": "Meta (Facebook/Instagram) pixel ID: 8-20 digits.",
+            "pattern": "^\\d{8,20}$"
+          },
+          "tiktok_pixel_id": {
+            "type": "string",
+            "description": "TikTok pixel ID.",
+            "pattern": "^[A-Z0-9]{10,30}$"
+          },
+          "google_ads_id": {
+            "type": "string",
+            "description": "Google Ads tag ID.",
+            "pattern": "^AW-\\d{6,15}$"
+          },
+          "google_ads_label": {
+            "type": "string",
+            "description": "Google Ads conversion label for store clicks.",
+            "pattern": "^[A-Za-z0-9_-]{4,40}$"
+          },
+          "snapchat_pixel_id": {
+            "type": "string",
+            "description": "Snapchat pixel ID (UUID).",
+            "format": "uuid"
+          }
+        }
+      },
+      "ShareImages": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Promo images (PNG): addresses that always serve the current design (artwork, stores, your branding). `null` for drafts.",
+        "properties": {
+          "story": {
+            "type": "string",
+            "description": "1080×1920.",
+            "format": "uri"
+          },
+          "square": {
+            "type": "string",
+            "description": "1080×1080.",
+            "format": "uri"
+          },
+          "wide": {
+            "type": "string",
+            "description": "1200×630.",
+            "format": "uri"
+          }
+        }
+      },
+      "LinkCreate": {
+        "type": "object",
+        "description": "Send at least one of `upc`, `isrc` or `url`, or `artist_name` and `release_title` with store links.",
+        "properties": {
+          "upc": {
+            "type": "string",
+            "description": "Release UPC/EAN."
+          },
+          "isrc": {
+            "type": "string",
+            "description": "Track ISRC."
+          },
+          "url": {
+            "type": "string",
+            "description": "A Spotify, Apple Music, YouTube or Deezer link to the release.",
+            "format": "uri"
+          },
+          "release_date": {
+            "type": "string",
+            "description": "ISO 8601. In the future = pre-save link.",
+            "format": "date-time"
+          },
+          "link_type": {
+            "type": "string",
+            "description": "Normally inferred from release_date.",
+            "enum": [
+              "release",
+              "presave"
+            ]
+          },
+          "artist_name": {
+            "type": "string",
+            "description": "Artist name (filled from the stores when found).",
+            "maxLength": 120
+          },
+          "release_title": {
+            "type": "string",
+            "description": "Release title (filled from the stores when found).",
+            "maxLength": 160
+          },
+          "artwork_url": {
+            "type": "string",
+            "description": "Cover image (https). Filled from the stores when found.",
+            "format": "uri"
+          },
+          "artist_image_url": {
+            "type": "string",
+            "description": "Artist photo (https), used on the page and promo images.",
+            "format": "uri"
+          },
+          "owner_email": {
+            "type": "string",
+            "description": "The artist's email: they get their link, edit link and promo images.",
+            "format": "email"
+          },
+          "owner_uid": {
+            "type": "string",
+            "description": "Your user's id, for My links in your embed (account linking)."
+          },
+          "published": {
+            "type": "boolean",
+            "default": true,
+            "description": "false creates a draft."
+          },
+          "spotify_url": {
+            "type": "string",
+            "description": "Spotify link (https, on Spotify's own domain).",
+            "format": "uri"
+          },
+          "apple_music_url": {
+            "type": "string",
+            "description": "Apple Music link (https, on Apple Music's own domain).",
+            "format": "uri"
+          },
+          "youtube_music_url": {
+            "type": "string",
+            "description": "YouTube Music link (https, on YouTube Music's own domain).",
+            "format": "uri"
+          },
+          "audiomack_url": {
+            "type": "string",
+            "description": "Audiomack link (https, on Audiomack's own domain).",
+            "format": "uri"
+          },
+          "boomplay_url": {
+            "type": "string",
+            "description": "Boomplay link (https, on Boomplay's own domain).",
+            "format": "uri"
+          },
+          "deezer_url": {
+            "type": "string",
+            "description": "Deezer link (https, on Deezer's own domain).",
+            "format": "uri"
+          },
+          "tidal_url": {
+            "type": "string",
+            "description": "TIDAL link (https, on TIDAL's own domain).",
+            "format": "uri"
+          },
+          "amazon_music_url": {
+            "type": "string",
+            "description": "Amazon Music link (https, on Amazon Music's own domain).",
+            "format": "uri"
+          },
+          "soundcloud_url": {
+            "type": "string",
+            "description": "SoundCloud link (https, on SoundCloud's own domain).",
+            "format": "uri"
+          },
+          "tiktok_url": {
+            "type": "string",
+            "description": "TikTok link (https, on TikTok's own domain).",
+            "format": "uri"
+          },
+          "itunes_url": {
+            "type": "string",
+            "description": "iTunes link (https, on iTunes's own domain).",
+            "format": "uri"
+          },
+          "pandora_url": {
+            "type": "string",
+            "description": "Pandora link (https, on Pandora's own domain).",
+            "format": "uri"
+          },
+          "iheartradio_url": {
+            "type": "string",
+            "description": "iHeartRadio link (https, on iHeartRadio's own domain).",
+            "format": "uri"
+          },
+          "napster_url": {
+            "type": "string",
+            "description": "Napster link (https, on Napster's own domain).",
+            "format": "uri"
+          },
+          "shazam_url": {
+            "type": "string",
+            "description": "Shazam link (https, on Shazam's own domain).",
+            "format": "uri"
+          },
+          "bandcamp_url": {
+            "type": "string",
+            "description": "Bandcamp link (https, on Bandcamp's own domain).",
+            "format": "uri"
+          },
+          "beatport_url": {
+            "type": "string",
+            "description": "Beatport link (https, on Beatport's own domain).",
+            "format": "uri"
+          },
+          "anghami_url": {
+            "type": "string",
+            "description": "Anghami link (https, on Anghami's own domain).",
+            "format": "uri"
+          },
+          "qobuz_url": {
+            "type": "string",
+            "description": "Qobuz link (https, on Qobuz's own domain).",
+            "format": "uri"
+          },
+          "jiosaavn_url": {
+            "type": "string",
+            "description": "JioSaavn link (https, on JioSaavn's own domain).",
+            "format": "uri"
+          },
+          "netease_url": {
+            "type": "string",
+            "description": "NetEase Cloud Music link (https, on NetEase Cloud Music's own domain).",
+            "format": "uri"
+          },
+          "mixcloud_url": {
+            "type": "string",
+            "description": "Mixcloud link (https, on Mixcloud's own domain).",
+            "format": "uri"
+          },
+          "meta_pixel_id": {
+            "type": "string",
+            "description": "Meta (Facebook/Instagram) pixel ID: 8-20 digits.",
+            "pattern": "^\\d{8,20}$"
+          },
+          "tiktok_pixel_id": {
+            "type": "string",
+            "description": "TikTok pixel ID.",
+            "pattern": "^[A-Z0-9]{10,30}$"
+          },
+          "google_ads_id": {
+            "type": "string",
+            "description": "Google Ads tag ID.",
+            "pattern": "^AW-\\d{6,15}$"
+          },
+          "google_ads_label": {
+            "type": "string",
+            "description": "Google Ads conversion label for store clicks.",
+            "pattern": "^[A-Za-z0-9_-]{4,40}$"
+          },
+          "snapchat_pixel_id": {
+            "type": "string",
+            "description": "Snapchat pixel ID (UUID).",
+            "format": "uuid"
+          }
+        }
+      },
+      "LinkUpdate": {
+        "type": "object",
+        "description": "Any of these; fields you don't send keep their values.",
+        "properties": {
+          "artist_name": {
+            "type": "string",
+            "description": "Artist name (filled from the stores when found).",
+            "maxLength": 120
+          },
+          "release_title": {
+            "type": "string",
+            "description": "Release title (filled from the stores when found).",
+            "maxLength": 160
+          },
+          "artwork_url": {
+            "type": "string",
+            "description": "Cover image (https). Filled from the stores when found.",
+            "format": "uri"
+          },
+          "artist_image_url": {
+            "type": "string",
+            "description": "Artist photo (https), used on the page and promo images.",
+            "format": "uri"
+          },
+          "release_date": {
+            "type": "string",
+            "description": "ISO 8601. In the future = pre-save link.",
+            "format": "date-time"
+          },
+          "upc": {
+            "type": "string",
+            "description": "Release UPC/EAN."
+          },
+          "isrc": {
+            "type": "string",
+            "description": "Track ISRC."
+          },
+          "owner_email": {
+            "type": "string",
+            "description": "The artist's email: they get their link, edit link and promo images.",
+            "format": "email"
+          },
+          "owner_uid": {
+            "type": "string",
+            "description": "Your user's id, for My links in your embed (account linking)."
+          },
+          "published": {
+            "type": "boolean",
+            "description": "false takes the link offline (draft); true publishes it again."
+          },
+          "rescan_interval_hours": {
+            "type": "integer",
+            "description": "Hours between store re-scans (0 turns re-scans off). Leave unset for the automatic schedule."
+          },
+          "rescan_window_days": {
+            "type": "integer",
+            "enum": [
+              2,
+              7,
+              14,
+              30,
+              90
+            ],
+            "description": "How many days after release to keep re-scanning."
+          },
+          "spotify_url": {
+            "type": "string",
+            "description": "Spotify link (https, on Spotify's own domain).",
+            "format": "uri"
+          },
+          "apple_music_url": {
+            "type": "string",
+            "description": "Apple Music link (https, on Apple Music's own domain).",
+            "format": "uri"
+          },
+          "youtube_music_url": {
+            "type": "string",
+            "description": "YouTube Music link (https, on YouTube Music's own domain).",
+            "format": "uri"
+          },
+          "audiomack_url": {
+            "type": "string",
+            "description": "Audiomack link (https, on Audiomack's own domain).",
+            "format": "uri"
+          },
+          "boomplay_url": {
+            "type": "string",
+            "description": "Boomplay link (https, on Boomplay's own domain).",
+            "format": "uri"
+          },
+          "deezer_url": {
+            "type": "string",
+            "description": "Deezer link (https, on Deezer's own domain).",
+            "format": "uri"
+          },
+          "tidal_url": {
+            "type": "string",
+            "description": "TIDAL link (https, on TIDAL's own domain).",
+            "format": "uri"
+          },
+          "amazon_music_url": {
+            "type": "string",
+            "description": "Amazon Music link (https, on Amazon Music's own domain).",
+            "format": "uri"
+          },
+          "soundcloud_url": {
+            "type": "string",
+            "description": "SoundCloud link (https, on SoundCloud's own domain).",
+            "format": "uri"
+          },
+          "tiktok_url": {
+            "type": "string",
+            "description": "TikTok link (https, on TikTok's own domain).",
+            "format": "uri"
+          },
+          "itunes_url": {
+            "type": "string",
+            "description": "iTunes link (https, on iTunes's own domain).",
+            "format": "uri"
+          },
+          "pandora_url": {
+            "type": "string",
+            "description": "Pandora link (https, on Pandora's own domain).",
+            "format": "uri"
+          },
+          "iheartradio_url": {
+            "type": "string",
+            "description": "iHeartRadio link (https, on iHeartRadio's own domain).",
+            "format": "uri"
+          },
+          "napster_url": {
+            "type": "string",
+            "description": "Napster link (https, on Napster's own domain).",
+            "format": "uri"
+          },
+          "shazam_url": {
+            "type": "string",
+            "description": "Shazam link (https, on Shazam's own domain).",
+            "format": "uri"
+          },
+          "bandcamp_url": {
+            "type": "string",
+            "description": "Bandcamp link (https, on Bandcamp's own domain).",
+            "format": "uri"
+          },
+          "beatport_url": {
+            "type": "string",
+            "description": "Beatport link (https, on Beatport's own domain).",
+            "format": "uri"
+          },
+          "anghami_url": {
+            "type": "string",
+            "description": "Anghami link (https, on Anghami's own domain).",
+            "format": "uri"
+          },
+          "qobuz_url": {
+            "type": "string",
+            "description": "Qobuz link (https, on Qobuz's own domain).",
+            "format": "uri"
+          },
+          "jiosaavn_url": {
+            "type": "string",
+            "description": "JioSaavn link (https, on JioSaavn's own domain).",
+            "format": "uri"
+          },
+          "netease_url": {
+            "type": "string",
+            "description": "NetEase Cloud Music link (https, on NetEase Cloud Music's own domain).",
+            "format": "uri"
+          },
+          "mixcloud_url": {
+            "type": "string",
+            "description": "Mixcloud link (https, on Mixcloud's own domain).",
+            "format": "uri"
+          },
+          "meta_pixel_id": {
+            "type": "string",
+            "description": "Meta (Facebook/Instagram) pixel ID: 8-20 digits.",
+            "pattern": "^\\d{8,20}$"
+          },
+          "tiktok_pixel_id": {
+            "type": "string",
+            "description": "TikTok pixel ID.",
+            "pattern": "^[A-Z0-9]{10,30}$"
+          },
+          "google_ads_id": {
+            "type": "string",
+            "description": "Google Ads tag ID.",
+            "pattern": "^AW-\\d{6,15}$"
+          },
+          "google_ads_label": {
+            "type": "string",
+            "description": "Google Ads conversion label for store clicks.",
+            "pattern": "^[A-Za-z0-9_-]{4,40}$"
+          },
+          "snapchat_pixel_id": {
+            "type": "string",
+            "description": "Snapchat pixel ID (UUID).",
+            "format": "uuid"
+          }
+        }
+      },
+      "Link": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The link's id. Use it in /links/{id}."
+          },
+          "url": {
+            "type": "string",
+            "description": "The public link to share (your own domain once connected).",
+            "format": "uri"
+          },
+          "slug": {
+            "type": "string",
+            "description": "The address after the domain."
+          },
+          "share_images": {
+            "$ref": "#/components/schemas/ShareImages"
+          },
+          "state": {
+            "type": "string",
+            "description": "`draft` (offline), `presave` (before the release date) or `live`.",
+            "enum": [
+              "draft",
+              "presave",
+              "live"
+            ]
+          },
+          "artist_name": {
+            "type": "string",
+            "description": "Artist name shown on the page."
+          },
+          "release_title": {
+            "type": "string",
+            "description": "Release title shown on the page."
+          },
+          "release_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release date and time (ISO 8601). Pre-save pages switch to play links at this time.",
+            "format": "date-time"
+          },
+          "artwork_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cover image.",
+            "format": "uri"
+          },
+          "upc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release UPC/EAN."
+          },
+          "isrc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Track ISRC."
+          },
+          "owner_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The artist's email, if given (they received their link and promo images)."
+          },
+          "owner_uid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Your user's id, if given (account linking / My links)."
+          },
+          "stores": {
+            "$ref": "#/components/schemas/Stores"
+          },
+          "pixels": {
+            "$ref": "#/components/schemas/Pixels"
+          },
+          "presave_stores": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "enum": [
+                "spotify",
+                "apple",
+                "tidal",
+                "youtube"
+              ]
+            },
+            "description": "Pre-save links (GET one link): stores where fans can pre-save by signing in."
+          },
+          "views": {
+            "type": "integer",
+            "description": "Page views, all time."
+          },
+          "clicks": {
+            "type": "integer",
+            "description": "Store button clicks, all time."
+          },
+          "presaves": {
+            "type": "integer",
+            "description": "Pre-saves (email sign-ups and store sign-ins), all time."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "When the link was created.",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "When the link was last changed.",
+            "format": "date-time"
+          }
+        },
+        "example": {
+          "id": "8c1d2b0e-5f3a-4c7e-9a10-2b6f0d4e7a11",
+          "url": "https://links.yourplatform.com/artist-name-release-title",
+          "slug": "artist-name-release-title",
+          "share_images": {
+            "story": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/story.png",
+            "square": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/square.png",
+            "wide": "https://starlinks.starmakersdistro.com/share-image/artist-name-release-title/wide.png"
+          },
+          "state": "presave",
+          "artist_name": "Artist Name",
+          "release_title": "Release Title",
+          "release_date": "2026-11-20T00:00:00.000Z",
+          "artwork_url": "https://i.scdn.co/image/ab67616d0000b273...",
+          "upc": "196871234567",
+          "isrc": "QZABC2600001",
+          "owner_email": "artist@example.com",
+          "owner_uid": "user-42",
+          "stores": {
+            "spotify_url": "https://open.spotify.com/album/...",
+            "apple_music_url": "https://music.apple.com/album/..."
+          },
+          "pixels": {},
+          "views": 0,
+          "clicks": 0,
+          "presaves": 0,
+          "created_at": "2026-10-17T18:00:00.000Z",
+          "updated_at": "2026-10-17T18:00:00.000Z"
+        }
+      },
+      "LinkSummary": {
+        "type": "object",
+        "description": "A link in the list (GET /links): fetch one link for stores, pixels and analytics.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The link's id. Use it in /links/{id}."
+          },
+          "url": {
+            "type": "string",
+            "description": "The public link to share (your own domain once connected).",
+            "format": "uri"
+          },
+          "share_images": {
+            "$ref": "#/components/schemas/ShareImages"
+          },
+          "state": {
+            "type": "string",
+            "description": "`draft` (offline), `presave` (before the release date) or `live`.",
+            "enum": [
+              "draft",
+              "presave",
+              "live"
+            ]
+          },
+          "artist_name": {
+            "type": "string",
+            "description": "Artist name shown on the page."
+          },
+          "release_title": {
+            "type": "string",
+            "description": "Release title shown on the page."
+          },
+          "release_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release date and time (ISO 8601). Pre-save pages switch to play links at this time.",
+            "format": "date-time"
+          },
+          "upc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release UPC/EAN."
+          },
+          "isrc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Track ISRC."
+          },
+          "owner_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The artist's email, if given (they received their link and promo images)."
+          },
+          "owner_uid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Your user's id, if given (account linking / My links)."
+          },
+          "views": {
+            "type": "integer",
+            "description": "Page views, all time."
+          },
+          "clicks": {
+            "type": "integer",
+            "description": "Store button clicks, all time."
+          }
+        }
+      },
+      "LinkResult": {
+        "type": "object",
+        "required": [
+          "existing",
+          "link"
+        ],
+        "properties": {
+          "existing": {
+            "type": "boolean",
+            "description": "true when this release already had a link."
+          },
+          "link": {
+            "$ref": "#/components/schemas/Link"
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "description": "Analytics for the requested number of days (GET /links/{id}?stats=<days>).",
+        "properties": {
+          "days": {
+            "type": "integer",
+            "description": "Number of days covered, ending today (UTC)."
+          },
+          "totals": {
+            "type": "object",
+            "description": "Sums over the period.",
+            "properties": {
+              "views": {
+                "type": "integer",
+                "description": "Page views."
+              },
+              "clicks": {
+                "type": "integer",
+                "description": "Store button clicks."
+              },
+              "fans": {
+                "type": "integer",
+                "description": "Release-day email sign-ups."
+              }
+            }
+          },
+          "daily": {
+            "type": "array",
+            "description": "One entry per day, oldest first.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "day": {
+                  "type": "string",
+                  "description": "Date (YYYY-MM-DD, UTC)."
+                },
+                "views": {
+                  "type": "integer",
+                  "description": "Page views."
+                },
+                "clicks": {
+                  "type": "integer",
+                  "description": "Store button clicks."
+                },
+                "fans": {
+                  "type": "integer",
+                  "description": "Release-day email sign-ups."
+                }
+              }
+            }
+          },
+          "platforms": {
+            "type": "array",
+            "description": "Store clicks by store (e.g. spotify, apple_music).",
+            "items": {
+              "$ref": "#/components/schemas/Count"
+            }
+          },
+          "countries": {
+            "type": "array",
+            "description": "Views and clicks by country (ISO code).",
+            "items": {
+              "$ref": "#/components/schemas/Count"
+            }
+          },
+          "devices": {
+            "type": "array",
+            "description": "Views and clicks by device (mobile, desktop, tablet).",
+            "items": {
+              "$ref": "#/components/schemas/Count"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "description": "Views and clicks by traffic source (e.g. qr, instagram, direct).",
+            "items": {
+              "$ref": "#/components/schemas/Count"
+            }
+          }
+        }
+      },
+      "Count": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "What was counted (store, country, device or source)."
+          },
+          "count": {
+            "type": "integer",
+            "description": "How many."
+          }
+        }
+      },
+      "Release": {
+        "type": "object",
+        "description": "A release found by search.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Source and id, e.g. `spotify:<id>`."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Album or single track.",
+            "enum": [
+              "album",
+              "track"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "description": "Release or track title."
+          },
+          "artist": {
+            "type": "string",
+            "description": "Artist names, comma-separated."
+          },
+          "image": {
+            "type": "string",
+            "description": "Cover thumbnail.",
+            "format": "uri"
+          },
+          "type": {
+            "type": "string",
+            "description": "album, single, EP, compilation or song."
+          },
+          "year": {
+            "type": "string",
+            "description": "Release year."
+          },
+          "url": {
+            "type": "string",
+            "description": "Store link: pass it as `url` to create the link.",
+            "format": "uri"
+          }
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Where the results come from.",
+            "enum": [
+              "spotify",
+              "deezer",
+              ""
+            ]
+          },
+          "artists": {
+            "type": "array",
+            "description": "Matching artists.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Artist reference: use it with /artists/{ref}/releases."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Artist name."
+                },
+                "image": {
+                  "type": "string",
+                  "description": "Artist photo.",
+                  "format": "uri"
+                }
+              }
+            }
+          },
+          "albums": {
+            "type": "array",
+            "description": "Matching albums, EPs and singles.",
+            "items": {
+              "$ref": "#/components/schemas/Release"
+            }
+          },
+          "tracks": {
+            "type": "array",
+            "description": "Matching tracks.",
+            "items": {
+              "$ref": "#/components/schemas/Release"
+            }
+          }
+        }
+      },
+      "ArtistReleases": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Where the results come from.",
+            "enum": [
+              "spotify",
+              "deezer"
+            ]
+          },
+          "artist": {
+            "type": "object",
+            "description": "The artist.",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Artist reference."
+              },
+              "name": {
+                "type": "string",
+                "description": "Artist name."
+              },
+              "image": {
+                "type": "string",
+                "description": "Artist photo.",
+                "format": "uri"
+              }
+            }
+          },
+          "releases": {
+            "type": "array",
+            "description": "Albums and singles, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/Release"
+            }
+          }
+        }
+      },
+      "WebhookEnvelope": {
+        "type": "object",
+        "description": "Every webhook is a POST with this JSON body and the headers `Starlinks-Event`, `Starlinks-Delivery` (id) and `Starlinks-Signature: t=<unix seconds>,v1=<hex>`, where v1 = HMAC-SHA256(signing secret, `<t>.<raw body>`). Verify it and reject old timestamps (e.g. over 5 minutes).",
+        "required": [
+          "id",
+          "type",
+          "created_at",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Delivery id (same on retries: use it to ignore duplicates)."
+          },
+          "type": {
+            "type": "string",
+            "description": "Event name."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "When the event happened.",
+            "format": "date-time"
+          },
+          "data": {
+            "type": "object",
+            "description": "Event details: always `link`, plus the fields listed for each event."
+          }
+        }
+      },
+      "WebhookLink": {
+        "type": "object",
+        "description": "The link as the API shows it, without analytics or images.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The link's id. Use it in /links/{id}."
+          },
+          "url": {
+            "type": "string",
+            "description": "The public link to share (your own domain once connected).",
+            "format": "uri"
+          },
+          "slug": {
+            "type": "string",
+            "description": "The address after the domain."
+          },
+          "state": {
+            "type": "string",
+            "description": "`draft` (offline), `presave` (before the release date) or `live`.",
+            "enum": [
+              "draft",
+              "presave",
+              "live"
+            ]
+          },
+          "artist_name": {
+            "type": "string",
+            "description": "Artist name shown on the page."
+          },
+          "release_title": {
+            "type": "string",
+            "description": "Release title shown on the page."
+          },
+          "release_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release date and time (ISO 8601). Pre-save pages switch to play links at this time.",
+            "format": "date-time"
+          },
+          "artwork_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cover image.",
+            "format": "uri"
+          },
+          "upc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Release UPC/EAN."
+          },
+          "isrc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Track ISRC."
+          },
+          "owner_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The artist's email, if given (they received their link and promo images)."
+          },
+          "owner_uid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Your user's id, if given (account linking / My links)."
+          },
+          "stores": {
+            "$ref": "#/components/schemas/Stores"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "When the link was created.",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "When the link was last changed.",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}
