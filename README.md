@@ -36,7 +36,7 @@ Optional account linking (your signed-in users see **My links**), with Node.js, 
 ### Option 2: API
 
 ```bash
-curl -X POST "https://amplika.starmakersdistro.com/api/v1/links" \
+curl -X POST "https://amp.starmakersdistro.com/api/v1/links" \
   -H "Authorization: Bearer $AMPLIKA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "upc": "196871234567", "release_date": "2026-11-20T00:00:00Z", "owner_email": "artist@example.com" }'
