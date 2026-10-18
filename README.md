@@ -1,4 +1,6 @@
-# Starlinks for distributors
+# Amplika for distributors
+
+Amplika by Star Makers Distribution (formerly Starlinks): music links infrastructure.
 
 Smart links, pre-saves, analytics and promo images for your artists and labels, under your own brand.
 
@@ -20,7 +22,7 @@ Both use your branding and show up in your distributor portal, where you also ge
 Copy your code from the portal (it contains your embed key) and list the domains where you'll use it. It looks like this:
 
 ```html
-<iframe id="starlinks-embed" src="https://www.starmakersdistro.com/embed/<your embed key>" title="Create a smart link" width="100%" height="900" style="border:0;border-radius:16px;max-width:1100px" loading="lazy" allow="clipboard-write; web-share"></iframe>
+<iframe id="starlinks-embed" src="https://www.starmakersdistro.com/embed/<your embed key>" title="Create a smartlink" width="100%" height="900" style="border:0;border-radius:16px;max-width:1100px" loading="lazy" allow="clipboard-write; web-share"></iframe>
 <script>
   window.addEventListener("message", function (event) {
     if (event.origin !== "https://www.starmakersdistro.com" || !event.data || event.data.type !== "starlinks:resize") return;
@@ -34,8 +36,8 @@ Optional account linking (your signed-in users see **My links**), with Node.js, 
 ### Option 2: API
 
 ```bash
-curl -X POST "https://starlinks.starmakersdistro.com/api/v1/links" \
-  -H "Authorization: Bearer $STARLINKS_API_KEY" \
+curl -X POST "https://amplika.starmakersdistro.com/api/v1/links" \
+  -H "Authorization: Bearer $AMPLIKA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "upc": "196871234567", "release_date": "2026-11-20T00:00:00Z", "owner_email": "artist@example.com" }'
 ```
